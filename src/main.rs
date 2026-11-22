@@ -62,7 +62,7 @@ fn mkref(buf: usize, off: usize, len: usize) -> u64 {
     ((buf as u64) << 48) | ((len as u64) << 32) | off as u64
 }
 #[inline]
-fn deref<'a>(bufs: &'a [Vec<u8>], r: u64) -> &'a [u8] {
+fn deref<'a>(bufs: &'a [&'static [u8]], r: u64) -> &'a [u8] {
     let b = (r >> 48) as usize;
     let l = ((r >> 32) & 0xffff) as usize;
     let o = (r & 0xffff_ffff) as usize;
@@ -123,6 +123,90 @@ fn split<const N: usize>(line: &[u8]) -> Option<[(u32, u32); N]> {
     Some(out)
 }
 
+
+const LO: u64 = 0x0101010101010101;
+const HI: u64 = 0x8080808080808080;
+#[inline(always)]
+fn has(w: u64, c: u8) -> u64 {
+    let x = w ^ (LO * c as u64);
+    x.wrapping_sub(LO) & !x & HI
+}
+#[inline(always)]
+fn next_special(buf: &[u8], mut i: usize, e: usize) -> usize {
+    while i + 8 <= e {
+        let w = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+        let m = has(w, b',') | has(w, b'\n') | has(w, b'"');
+        if m != 0 {
+            return i + (m.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < e {
+        let c = buf[i];
+        if c == b',' || c == b'\n' || c == b'"' {
+            return i;
+        }
+        i += 1;
+    }
+    e
+}
+
+/// Scan lines in buf[s..e). For every well-formed line with exactly N fields,
+/// call f(line_start, fields) with absolute (start,end) of unquoted values.
+#[inline(always)]
+fn scan<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut(usize, &[(u32, u32); N])) {
+    let mut fl = [(0u32, 0u32); N];
+    let mut ls = s;
+    let mut fs = s;
+    let mut k = 0usize;
+    let mut q = false;
+    let mut bad = false;
+    let mut i = s;
+    loop {
+        let j = next_special(buf, i, e);
+        let c = if j < e { buf[j] } else { b'\n' };
+        if c == b'"' {
+            q = true;
+            i = j + 1;
+            continue;
+        }
+        // end of field at j
+        if !bad {
+            if k >= N {
+                bad = true;
+            } else {
+                let (mut a, mut b) = (fs, j);
+                if q {
+                    if b - a < 2 || buf[a] != b'"' || buf[b - 1] != b'"' || buf[a + 1..b - 1].contains(&b'"') {
+                        bad = true;
+                    }
+                    a += 1;
+                    b -= 1;
+                }
+                fl[k] = (a as u32, b as u32);
+                k += 1;
+            }
+        }
+        q = false;
+        fs = j + 1;
+        if c == b'\n' {
+            if !bad && k == N && !(N >= 1 && j == ls) {
+                f(ls, &fl);
+            }
+            if j >= e {
+                break;
+            }
+            ls = j + 1;
+            k = 0;
+            bad = false;
+            if ls >= e {
+                break;
+            }
+        }
+        i = j + 1;
+    }
+}
+
 // ---------------- time ----------------
 #[inline]
 fn d2(s: &[u8], i: usize) -> Option<i64> {
@@ -141,6 +225,13 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
+}
+thread_local! {
+    static MONTH_DAYS: Vec<i64> = {
+        let mut v = Vec::with_capacity(230 * 12);
+        for y in 1970..2200 { for m in 1..=12 { v.push(days_from_civil(y, m, 1)); } }
+        v
+    };
 }
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
@@ -174,7 +265,12 @@ fn parse_dt(s: &[u8]) -> Option<i64> {
     if d > mdays {
         return None;
     }
-    Some(days_from_civil(y, mo, d) * DAY_MS + (h * 3600 + mi * 60 + se) * 1000)
+    let days = if (1970..2200).contains(&y) {
+        MONTH_DAYS.with(|t| t[((y - 1970) * 12 + mo - 1) as usize]) + d - 1
+    } else {
+        days_from_civil(y, mo, d)
+    };
+    Some(days * DAY_MS + (h * 3600 + mi * 60 + se) * 1000)
 }
 /// Returns None for a bad format. Out-of-range F3 returns i64::MAX (outside any window).
 #[inline]
@@ -219,6 +315,70 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     }
     Some(v as i64)
 }
+
+// Per-thread cache of "YYYY-MM-DDTHH" prefixes -> base ms (or invalid).
+struct TsCache {
+    k1: Vec<u64>,
+    k2: Vec<u64>,
+    v: Vec<i64>, // i64::MIN = invalid
+}
+const TS_BAD: i64 = i64::MIN;
+impl TsCache {
+    fn new() -> TsCache {
+        TsCache { k1: vec![0; 4096], k2: vec![0; 4096], v: vec![0; 4096] }
+    }
+    #[inline(always)]
+    fn base(&mut self, s: &[u8]) -> i64 {
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(s[5..13].try_into().unwrap());
+        let i = ((a.wrapping_mul(0x9e3779b97f4a7c15) ^ b.wrapping_mul(0xc2b2ae3d27d4eb4f)) >> 52) as usize;
+        if self.k1[i] == a && self.k2[i] == b {
+            return self.v[i];
+        }
+        let mut tmp = [0u8; 20];
+        tmp[..13].copy_from_slice(&s[..13]);
+        tmp[13..].copy_from_slice(b":00:00Z");
+        let v = parse_dt(&tmp).unwrap_or(TS_BAD);
+        self.k1[i] = a;
+        self.k2[i] = b;
+        self.v[i] = v;
+        v
+    }
+    #[inline(always)]
+    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if (n == 20 && s[19] == b'Z') || (n == 25 && (s[19] == b'+' || s[19] == b'-')) {
+            if s[13] != b':' || s[16] != b':' {
+                return None;
+            }
+            let mi = d2(s, 14)?;
+            let se = d2(s, 17)?;
+            if mi > 59 || se > 59 {
+                return None;
+            }
+            let base = self.base(s);
+            if base == TS_BAD {
+                return None;
+            }
+            let t = base + (mi * 60 + se) * 1000;
+            if n == 20 {
+                return Some(t);
+            }
+            if s[22] != b':' {
+                return None;
+            }
+            let oh = d2(s, 20)?;
+            let om = d2(s, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh * 60 + om) * 60_000;
+            return Some(if s[19] == b'+' { t - off } else { t + off });
+        }
+        parse_ts(s)
+    }
+}
+
 #[inline]
 fn parse_price(s: &[u8]) -> u32 {
     // 0 = invalid
@@ -277,24 +437,85 @@ struct Ck {
     camp: u32,
 }
 
+
+// Open-addressing map: uid hash -> (person hash, name ref). Key 0 = empty.
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct Slot {
+    key: u64,
+    ph: u64,
+    nref: u64,
+    _pad: u64,
+}
+struct Flat {
+    slots: Vec<Slot>,
+    mask: usize,
+}
+impl Flat {
+    fn new(n: usize) -> Flat {
+        let cap = (n.max(16) * 2).next_power_of_two();
+        Flat { slots: vec![Slot::default(); cap], mask: cap - 1 }
+    }
+    #[inline(always)]
+    fn fix(k: u64) -> u64 {
+        if k == 0 { 1 } else { k }
+    }
+    #[inline(always)]
+    fn idx(&self, k: u64) -> usize {
+        (k as usize) & self.mask
+    }
+    fn insert(&mut self, k: u64, ph: u64, nref: u64) {
+        let k = Self::fix(k);
+        let mut i = self.idx(k);
+        loop {
+            let s = &mut self.slots[i];
+            if s.key == 0 || s.key == k {
+                *s = Slot { key: k, ph, nref, _pad: 0 };
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let i = self.idx(Self::fix(k));
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> Option<(u64, u64)> {
+        let k = Self::fix(k);
+        let mut i = self.idx(k);
+        loop {
+            let s = &self.slots[i];
+            if s.key == k {
+                return Some((s.ph, s.nref));
+            }
+            if s.key == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 struct Ctx {
-    bufs: Vec<Vec<u8>>,
+    bufs: Vec<&'static [u8]>,
     ws: i64,
     we: i64,
-    link_map: IdMap<u32>,     // uid hash -> comp
-    comps: Vec<(u64, u64)>,   // comp -> (name hash, name ref)
+    link_map: Flat,
     prod: IdMap<u16>,         // product hash -> category idx
     unknown_cat: u16,
     camps: IdMap<u32>,        // campaign hash -> idx
 }
 
-#[inline]
-fn person_of(ctx: &Ctx, uid: &[u8], uref: u64) -> (u64, u64) {
-    let h = h64(uid);
-    if let Some(&c) = ctx.link_map.get(&h) {
-        ctx.comps[c as usize]
-    } else {
-        (h, uref)
+#[inline(always)]
+fn resolve(ctx: &Ctx, h: u64, uref: u64) -> (u64, u64) {
+    match ctx.link_map.get(h) {
+        Some(x) => x,
+        None => (h, uref),
     }
 }
 
@@ -333,15 +554,28 @@ fn chunks(buf: &[u8], target: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// iterate lines in [s,e) of buf, calling f(line_start, line)
-#[inline]
-fn for_lines(buf: &[u8], s: usize, e: usize, mut f: impl FnMut(usize, &[u8])) {
-    let mut i = s;
-    while i < e {
-        let j = memchr_nl(&buf[..e], i);
-        f(i, &buf[i..j]);
-        i = j + 1;
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+/// Map a file read-only (leaked for the life of the process). Falls back to read().
+fn map_file(p: &Path) -> &'static [u8] {
+    use std::os::fd::AsRawFd;
+    if let Ok(f) = std::fs::File::open(p) {
+        let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        if len == 0 {
+            return &[];
+        }
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
+        if ptr as isize != -1 && !ptr.is_null() {
+            unsafe {
+                madvise(ptr, len, 2); // MADV_SEQUENTIAL
+                madvise(ptr, len, 3); // MADV_WILLNEED
+                return std::slice::from_raw_parts(ptr, len);
+            }
+        }
     }
+    Box::leak(std::fs::read(p).unwrap_or_default().into_boxed_slice())
 }
 
 fn run_par<F: Fn(usize) + Sync>(nthreads: usize, njobs: usize, f: F) {
@@ -469,39 +703,36 @@ fn main() {
         .map(|(i, p)| (std::fs::metadata(p).map(|m| m.len()).unwrap_or(0), i))
         .collect();
     sizes.sort_by(|a, b| b.cmp(a));
-    let slots: Vec<Mutex<Vec<u8>>> = (0..all.len()).map(|_| Mutex::new(Vec::new())).collect();
+    let slots: Vec<Mutex<&'static [u8]>> = (0..all.len()).map(|_| Mutex::new(&[][..])).collect();
     run_par(nthreads, sizes.len(), |j| {
         let i = sizes[j].1;
-        let b = std::fs::read(&all[i]).unwrap_or_default();
-        *slots[i].lock().unwrap() = b;
+        *slots[i].lock().unwrap() = map_file(&all[i]);
     });
-    let bufs: Vec<Vec<u8>> = slots.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let bufs: Vec<&'static [u8]> = slots.into_iter().map(|m| m.into_inner().unwrap()).collect();
     tlog!("read {} files", bufs.len());
 
     // ---------------- links ----------------
     let target = 8 << 20;
     let mut lchunks = Vec::new();
     for bi in 0..nl {
-        for (s, e) in chunks(&bufs[bi], target) {
+        for (s, e) in chunks(bufs[bi], target) {
             lchunks.push((bi, s, e));
         }
     }
     let lres: Vec<Mutex<Vec<(u64, u64, u64, u64)>>> = (0..lchunks.len()).map(|_| Mutex::new(Vec::new())).collect();
     run_par(nthreads, lchunks.len(), |j| {
         let (bi, s, e) = lchunks[j];
-        let buf = &bufs[bi];
+        let buf = bufs[bi];
         let mut v = Vec::new();
-        for_lines(buf, s, e, |ls, line| {
-            if let Some(f) = split::<2>(line) {
-                let (a0, a1) = (f[0].0 as usize, f[0].1 as usize);
-                let (b0, b1) = (f[1].0 as usize, f[1].1 as usize);
-                if a1 == a0 || b1 == b0 {
-                    return;
-                }
-                let a = &line[a0..a1];
-                let b = &line[b0..b1];
-                v.push((h64(a), mkref(bi, ls + a0, a1 - a0), h64(b), mkref(bi, ls + b0, b1 - b0)));
+        scan::<2>(buf, s, e, |_ls, f| {
+            let (a0, a1) = (f[0].0 as usize, f[0].1 as usize);
+            let (b0, b1) = (f[1].0 as usize, f[1].1 as usize);
+            if a1 == a0 || b1 == b0 {
+                return;
             }
+            let a = &buf[a0..a1];
+            let b = &buf[b0..b1];
+            v.push((h64(a), mkref(bi, a0, a1 - a0), h64(b), mkref(bi, b0, b1 - b0)));
         });
         *lres[j].lock().unwrap() = v;
     });
@@ -552,8 +783,7 @@ fn main() {
     }
     let mut comp_of_root: Vec<u32> = vec![u32::MAX; n_ids];
     let mut comps: Vec<(u64, u64)> = Vec::new();
-    let mut link_map: IdMap<u32> = IdMap::default();
-    link_map.reserve(n_ids);
+    let mut link_map = Flat::new(n_ids);
     for i in 0..n_ids {
         let r = find(&mut parent, i as u32) as usize;
         if comp_of_root[r] == u32::MAX {
@@ -561,22 +791,27 @@ fn main() {
             comp_of_root[r] = comps.len() as u32;
             comps.push((hs[b], ids[b]));
         }
-        link_map.insert(hs[i], comp_of_root[r]);
+        let c = comps[comp_of_root[r] as usize];
+        link_map.insert(hs[i], c.0, c.1);
     }
     drop(idx);
     tlog!("links: {} ids, {} persons", n_ids, comps.len());
 
-    let ctx = Ctx { bufs, ws, we, link_map, comps, prod, unknown_cat, camps };
+    let ctx = Ctx { bufs, ws, we, link_map, prod, unknown_cat, camps };
     let bufs = &ctx.bufs;
 
     // ---------------- parse events & clicks ----------------
     let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
     for bi in nl..nl + ne + cf.len() {
-        for (s, e) in chunks(&bufs[bi], target) {
+        for (s, e) in chunks(bufs[bi], target) {
             jobs.push((bi, s, e));
         }
     }
     // biggest first is implicit-ish; fine
+    let ev_bytes: usize = (nl..nl + ne).map(|i| bufs[i].len()).sum();
+    let ck_bytes: usize = (nl + ne..bufs.len()).map(|i| bufs[i].len()).sum();
+    let ev_res = ev_bytes / 55 / NP / nthreads * 3 / 2 + 64;
+    let ck_res = ck_bytes / 40 / NP / nthreads * 3 / 2 + 64;
     let ev_parts: Vec<Mutex<Vec<Vec<EvRaw>>>> = (0..NP).map(|_| Mutex::new(Vec::new())).collect();
     let ck_parts: Vec<Mutex<Vec<Vec<Ck>>>> = (0..NP).map(|_| Mutex::new(Vec::new())).collect();
     {
@@ -584,36 +819,35 @@ fn main() {
         std::thread::scope(|sc| {
             for _ in 0..nthreads {
                 sc.spawn(|| {
-                    let mut ep: Vec<Vec<EvRaw>> = (0..NP).map(|_| Vec::new()).collect();
-                    let mut cp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
+                    let mut ep: Vec<Vec<EvRaw>> = (0..NP).map(|_| Vec::with_capacity(ev_res)).collect();
+                    let mut cp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::with_capacity(ck_res)).collect();
                     let cws = ctx.ws - WEEK_MS;
+                    let mut pend_e: Vec<EvRaw> = Vec::new();
+                    let mut tsc = TsCache::new();
+                    let mut pend_c: Vec<Ck> = Vec::new();
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
                         if j >= jobs.len() {
                             break;
                         }
                         let (bi, s, e) = jobs[j];
-                        let buf = &bufs[bi];
+                        let buf = bufs[bi];
                         if bi < nl + ne {
-                            for_lines(buf, s, e, |ls, line| {
-                                let f = match split::<7>(line) {
-                                    Some(f) => f,
-                                    None => return,
-                                };
-                                let g = |k: usize| &line[f[k].0 as usize..f[k].1 as usize];
+                            scan::<7>(buf, s, e, |_ls, f| {
+                                let g = |k: usize| &buf[f[k].0 as usize..f[k].1 as usize];
                                 let eidb = g(0);
                                 if eidb.is_empty() {
                                     return;
                                 }
                                 let eid = h64(eidb);
-                                let ingest = parse_ts(g(3)).unwrap_or(i64::MAX);
+                                let ingest = tsc.parse(g(3)).unwrap_or(i64::MAX);
                                 let mut r = EvRaw { eid, ingest, person: 0, ts: 0, name: 0, price: 0, cat: 0, valid: false };
                                 'v: {
                                     let uid = g(1);
                                     if uid.is_empty() {
                                         break 'v;
                                     }
-                                    let ts = match parse_ts(g(2)) {
+                                    let ts = match tsc.parse(g(2)) {
                                         Some(t) if t >= ctx.ws && t < ctx.we => t,
                                         _ => break 'v,
                                     };
@@ -638,22 +872,29 @@ fn main() {
                                     if ingest - ts > DAY_MS {
                                         break 'v;
                                     }
-                                    let uref = mkref(bi, ls + f[1].0 as usize, uid.len());
-                                    let (p, nm) = person_of(&ctx, uid, uref);
-                                    r.person = p;
-                                    r.name = nm;
+                                    let uref = mkref(bi, f[1].0 as usize, uid.len());
+                                    r.person = h64(uid);
+                                    r.name = uref;
                                     r.ts = ts;
                                     r.valid = true;
                                 }
-                                ep[part_of(eid)].push(r);
+                                if r.valid { pend_e.push(r); } else { ep[part_of(eid)].push(r); }
                             });
+                            const PD: usize = 12;
+                            for q in 0..pend_e.len() {
+                                if q + PD < pend_e.len() {
+                                    ctx.link_map.prefetch(pend_e[q + PD].person);
+                                }
+                                let mut r = pend_e[q];
+                                let (p, nm) = resolve(&ctx, r.person, r.name);
+                                r.person = p;
+                                r.name = nm;
+                                ep[part_of(r.eid)].push(r);
+                            }
+                            pend_e.clear();
                         } else {
-                            for_lines(buf, s, e, |ls, line| {
-                                let f = match split::<4>(line) {
-                                    Some(f) => f,
-                                    None => return,
-                                };
-                                let g = |k: usize| &line[f[k].0 as usize..f[k].1 as usize];
+                            scan::<4>(buf, s, e, |_ls, f| {
+                                let g = |k: usize| &buf[f[k].0 as usize..f[k].1 as usize];
                                 let cid = g(0);
                                 if cid.is_empty() {
                                     return;
@@ -662,7 +903,7 @@ fn main() {
                                 if uid.is_empty() {
                                     return;
                                 }
-                                let ts = match parse_ts(g(3)) {
+                                let ts = match tsc.parse(g(3)) {
                                     Some(t) if t >= cws && t < ctx.we => t,
                                     _ => return,
                                 };
@@ -670,11 +911,21 @@ fn main() {
                                     Some(&c) => c,
                                     None => return,
                                 };
-                                let uref = mkref(bi, ls + f[1].0 as usize, uid.len());
-                                let (p, _) = person_of(&ctx, uid, uref);
-                                let cref = mkref(bi, ls + f[0].0 as usize, cid.len());
-                                cp[part_of(p)].push(Ck { person: p, ts, cref, camp });
+                                let uref = mkref(bi, f[1].0 as usize, uid.len());
+                                let _ = uref;
+                                let cref = mkref(bi, f[0].0 as usize, cid.len());
+                                pend_c.push(Ck { person: h64(uid), ts, cref, camp });
                             });
+                            const PD: usize = 12;
+                            for q in 0..pend_c.len() {
+                                if q + PD < pend_c.len() {
+                                    ctx.link_map.prefetch(pend_c[q + PD].person);
+                                }
+                                let mut c = pend_c[q];
+                                c.person = resolve(&ctx, c.person, 0).0;
+                                cp[part_of(c.person)].push(c);
+                            }
+                            pend_c.clear();
                         }
                     }
                     for (i, v) in ep.into_iter().enumerate() {
@@ -696,7 +947,7 @@ fn main() {
         std::thread::scope(|sc| {
             for _ in 0..nthreads {
                 sc.spawn(|| {
-                    let mut out: Vec<Vec<Ev>> = (0..NP).map(|_| Vec::new()).collect();
+                    let mut out: Vec<Vec<Ev>> = (0..NP).map(|_| Vec::with_capacity(ev_res)).collect();
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
                         if j >= NP {
