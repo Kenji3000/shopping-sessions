@@ -2,6 +2,7 @@ FROM --platform=linux/amd64 rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release
 
 FROM --platform=linux/amd64 debian:bookworm-slim
