@@ -2,8 +2,8 @@
 use std::io::Write;
 
 pub enum ColData {
-    Str(Vec<Vec<u8>>),           // required BYTE_ARRAY (UTF8)
-    OptStr(Vec<Option<Vec<u8>>>), // optional BYTE_ARRAY (UTF8)
+    Str(Vec<&'static [u8]>),           // required BYTE_ARRAY (UTF8)
+    OptStr(Vec<Option<&'static [u8]>>), // optional BYTE_ARRAY (UTF8)
     Date(Vec<i32>),              // required INT32 DATE
     I64(Vec<i64>),               // required INT64
 }

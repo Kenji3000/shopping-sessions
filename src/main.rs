@@ -62,11 +62,12 @@ fn mkref(buf: usize, off: usize, len: usize) -> u64 {
     ((buf as u64) << 48) | ((len as u64) << 32) | off as u64
 }
 #[inline]
-fn deref<'a>(bufs: &'a [&'static [u8]], r: u64) -> &'a [u8] {
+fn deref(bufs: &[&'static [u8]], r: u64) -> &'static [u8] {
     let b = (r >> 48) as usize;
     let l = ((r >> 32) & 0xffff) as usize;
     let o = (r & 0xffff_ffff) as usize;
-    &bufs[b][o..o + l]
+    let s: &'static [u8] = bufs[b];
+    &s[o..o + l]
 }
 
 // ---------------- CSV ----------------
@@ -151,6 +152,25 @@ fn next_special(buf: &[u8], mut i: usize, e: usize) -> usize {
     e
 }
 
+/// 64-bit mask of positions of ',', '\n', '"' in block[0..64].
+#[inline(always)]
+fn block_mask(p: *const u8) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm_set1_epi8(b',' as i8);
+        let n = _mm_set1_epi8(b'\n' as i8);
+        let q = _mm_set1_epi8(b'"' as i8);
+        let mut m: u64 = 0;
+        for k in 0..4 {
+            let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
+            let x = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c), _mm_cmpeq_epi8(v, n)), _mm_cmpeq_epi8(v, q));
+            m |= ((_mm_movemask_epi8(x) as u32) as u64) << (16 * k);
+        }
+        m
+    }
+}
+
 /// Scan lines in buf[s..e). For every well-formed line with exactly N fields,
 /// call f(line_start, fields) with absolute (start,end) of unquoted values.
 #[inline(always)]
@@ -159,51 +179,72 @@ fn scan<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut(usize,
     let mut ls = s;
     let mut fs = s;
     let mut k = 0usize;
-    let mut q = false;
+    let mut q = 0u32;
     let mut bad = false;
-    let mut i = s;
-    loop {
-        let j = next_special(buf, i, e);
-        let c = if j < e { buf[j] } else { b'\n' };
-        if c == b'"' {
-            q = true;
-            i = j + 1;
-            continue;
-        }
-        // end of field at j
-        if !bad {
-            if k >= N {
-                bad = true;
+    let mut pos = s;
+    let mut tmp = [0u8; 64];
+    // handle one special at absolute j with char c
+    macro_rules! special {
+        ($j:expr, $c:expr) => {{
+            let j: usize = $j;
+            let c: u8 = $c;
+            if c == b'"' {
+                q += 1;
             } else {
-                let (mut a, mut b) = (fs, j);
-                if q {
-                    if b - a < 2 || buf[a] != b'"' || buf[b - 1] != b'"' || buf[a + 1..b - 1].contains(&b'"') {
+                if !bad {
+                    if k >= N {
                         bad = true;
+                    } else {
+                        let (mut a, mut b) = (fs, j);
+                        if q != 0 {
+                            if q != 2 || b - a < 2 || buf[a] != b'"' || buf[b - 1] != b'"' {
+                                bad = true;
+                            }
+                            a += 1;
+                            b = b.wrapping_sub(1);
+                        }
+                        fl[k] = (a as u32, b as u32);
+                        k += 1;
                     }
-                    a += 1;
-                    b -= 1;
                 }
-                fl[k] = (a as u32, b as u32);
-                k += 1;
+                q = 0;
+                fs = j + 1;
+                if c == b'\n' {
+                    if !bad && k == N {
+                        f(ls, &fl);
+                    }
+                    ls = j + 1;
+                    k = 0;
+                    bad = false;
+                }
             }
+        }};
+    }
+    while pos < e {
+        let mut m = if pos + 64 <= buf.len() {
+            block_mask(unsafe { buf.as_ptr().add(pos) })
+        } else {
+            let n = buf.len() - pos;
+            tmp[..n].copy_from_slice(&buf[pos..]);
+            for x in tmp[n..].iter_mut() {
+                *x = 0;
+            }
+            block_mask(tmp.as_ptr())
+        };
+        let lim = e - pos;
+        if lim < 64 {
+            m &= (1u64 << lim) - 1;
         }
-        q = false;
-        fs = j + 1;
-        if c == b'\n' {
-            if !bad && k == N && !(N >= 1 && j == ls) {
-                f(ls, &fl);
-            }
-            if j >= e {
-                break;
-            }
-            ls = j + 1;
-            k = 0;
-            bad = false;
-            if ls >= e {
-                break;
-            }
+        while m != 0 {
+            let t = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let j = pos + t;
+            special!(j, unsafe { *buf.get_unchecked(j) });
         }
-        i = j + 1;
+        pos += 64;
+    }
+    if ls < e {
+        special!(e, b'\n');
     }
 }
 
@@ -505,15 +546,14 @@ struct Ctx {
     bufs: Vec<&'static [u8]>,
     ws: i64,
     we: i64,
-    link_map: Flat,
     prod: IdMap<u16>,         // product hash -> category idx
     unknown_cat: u16,
     camps: IdMap<u32>,        // campaign hash -> idx
 }
 
 #[inline(always)]
-fn resolve(ctx: &Ctx, h: u64, uref: u64) -> (u64, u64) {
-    match ctx.link_map.get(h) {
+fn resolve(lm: &Flat, h: u64, uref: u64) -> (u64, u64) {
+    match lm.get(h) {
         Some(x) => x,
         None => (h, uref),
     }
@@ -566,7 +606,7 @@ fn map_file(p: &Path) -> &'static [u8] {
         if len == 0 {
             return &[];
         }
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2 | 0x8000, f.as_raw_fd(), 0) };
         if ptr as isize != -1 && !ptr.is_null() {
             unsafe {
                 madvise(ptr, len, 2); // MADV_SEQUENTIAL
@@ -666,6 +706,7 @@ fn main() {
             (cat_names.len() - 1) as u16
         }
     };
+    let cat_names: Vec<&'static [u8]> = cat_names.into_iter().map(|v| &*Box::leak(v.into_boxed_slice())).collect();
     // rank by byte order for tie-breaks
     let mut order: Vec<usize> = (0..cat_names.len()).collect();
     order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
@@ -688,6 +729,8 @@ fn main() {
     camp_ids.push(b"organic".to_vec());
     camp_ch.push(b"organic".to_vec());
     let ncamp = camp_ids.len();
+    let camp_ids: Vec<&'static [u8]> = camp_ids.into_iter().map(|v| &*Box::leak(v.into_boxed_slice())).collect();
+    let camp_ch: Vec<&'static [u8]> = camp_ch.into_iter().map(|v| &*Box::leak(v.into_boxed_slice())).collect();
 
     // files
     let lf = list_csv(&data.join("links"));
@@ -736,69 +779,9 @@ fn main() {
         });
         *lres[j].lock().unwrap() = v;
     });
-    // union find
-    let mut idx: IdMap<u32> = IdMap::default();
-    let mut ids: Vec<u64> = Vec::new(); // refs
-    let mut hs: Vec<u64> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        while p[x as usize] != x {
-            let g = p[p[x as usize] as usize];
-            p[x as usize] = g;
-            x = g;
-        }
-        x
-    }
-    for m in lres {
-        let v = m.into_inner().unwrap();
-        for (ha, ra, hb, rb) in v {
-            let ia = *idx.entry(ha).or_insert_with(|| {
-                ids.push(ra);
-                hs.push(ha);
-                parent.push(parent.len() as u32);
-                (parent.len() - 1) as u32
-            });
-            let ib = *idx.entry(hb).or_insert_with(|| {
-                ids.push(rb);
-                hs.push(hb);
-                parent.push(parent.len() as u32);
-                (parent.len() - 1) as u32
-            });
-            let ra_ = find(&mut parent, ia);
-            let rb_ = find(&mut parent, ib);
-            if ra_ != rb_ {
-                parent[ra_ as usize] = rb_;
-            }
-        }
-    }
-    // min name per root
-    let n_ids = parent.len();
-    let mut best: Vec<u32> = vec![u32::MAX; n_ids];
-    for i in 0..n_ids as u32 {
-        let r = find(&mut parent, i) as usize;
-        let b = best[r];
-        if b == u32::MAX || deref(&bufs, ids[i as usize]) < deref(&bufs, ids[b as usize]) {
-            best[r] = i;
-        }
-    }
-    let mut comp_of_root: Vec<u32> = vec![u32::MAX; n_ids];
-    let mut comps: Vec<(u64, u64)> = Vec::new();
-    let mut link_map = Flat::new(n_ids);
-    for i in 0..n_ids {
-        let r = find(&mut parent, i as u32) as usize;
-        if comp_of_root[r] == u32::MAX {
-            let b = best[r] as usize;
-            comp_of_root[r] = comps.len() as u32;
-            comps.push((hs[b], ids[b]));
-        }
-        let c = comps[comp_of_root[r] as usize];
-        link_map.insert(hs[i], c.0, c.1);
-    }
-    drop(idx);
-    tlog!("links: {} ids, {} persons", n_ids, comps.len());
-
-    let ctx = Ctx { bufs, ws, we, link_map, prod, unknown_cat, camps };
+    let ctx = Ctx { bufs, ws, we, prod, unknown_cat, camps };
     let bufs = &ctx.bufs;
+    let link_cell: std::sync::OnceLock<Flat> = std::sync::OnceLock::new();
 
     // ---------------- parse events & clicks ----------------
     let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
@@ -814,17 +797,82 @@ fn main() {
     let ck_res = ck_bytes / 40 / NP / nthreads * 3 / 2 + 64;
     let ev_parts: Vec<Mutex<Vec<Vec<EvRaw>>>> = (0..NP).map(|_| Mutex::new(Vec::new())).collect();
     let ck_parts: Vec<Mutex<Vec<Vec<Ck>>>> = (0..NP).map(|_| Mutex::new(Vec::new())).collect();
+    let ck_all: Mutex<Vec<Vec<Ck>>> = Mutex::new(Vec::new());
     {
         let next = AtomicUsize::new(0);
         std::thread::scope(|sc| {
+            let lcell = &link_cell;
+            sc.spawn(move || {
+        // union find
+        let mut idx: IdMap<u32> = IdMap::default();
+        let mut ids: Vec<u64> = Vec::new(); // refs
+        let mut hs: Vec<u64> = Vec::new();
+        let mut parent: Vec<u32> = Vec::new();
+        fn find(p: &mut [u32], mut x: u32) -> u32 {
+            while p[x as usize] != x {
+                let g = p[p[x as usize] as usize];
+                p[x as usize] = g;
+                x = g;
+            }
+            x
+        }
+        for m in lres {
+            let v = m.into_inner().unwrap();
+            for (ha, ra, hb, rb) in v {
+                let ia = *idx.entry(ha).or_insert_with(|| {
+                    ids.push(ra);
+                    hs.push(ha);
+                    parent.push(parent.len() as u32);
+                    (parent.len() - 1) as u32
+                });
+                let ib = *idx.entry(hb).or_insert_with(|| {
+                    ids.push(rb);
+                    hs.push(hb);
+                    parent.push(parent.len() as u32);
+                    (parent.len() - 1) as u32
+                });
+                let ra_ = find(&mut parent, ia);
+                let rb_ = find(&mut parent, ib);
+                if ra_ != rb_ {
+                    parent[ra_ as usize] = rb_;
+                }
+            }
+        }
+        // min name per root
+        let n_ids = parent.len();
+        let mut best: Vec<u32> = vec![u32::MAX; n_ids];
+        for i in 0..n_ids as u32 {
+            let r = find(&mut parent, i) as usize;
+            let b = best[r];
+            if b == u32::MAX || deref(bufs, ids[i as usize]) < deref(bufs, ids[b as usize]) {
+                best[r] = i;
+            }
+        }
+        let mut comp_of_root: Vec<u32> = vec![u32::MAX; n_ids];
+        let mut comps: Vec<(u64, u64)> = Vec::new();
+        let mut link_map = Flat::new(n_ids);
+        for i in 0..n_ids {
+            let r = find(&mut parent, i as u32) as usize;
+            if comp_of_root[r] == u32::MAX {
+                let b = best[r] as usize;
+                comp_of_root[r] = comps.len() as u32;
+                comps.push((hs[b], ids[b]));
+            }
+            let c = comps[comp_of_root[r] as usize];
+            link_map.insert(hs[i], c.0, c.1);
+        }
+        drop(idx);
+        tlog!("links: {} ids, {} persons", n_ids, comps.len());
+        lcell.set(link_map).ok();
+
+
+            });
             for _ in 0..nthreads {
                 sc.spawn(|| {
                     let mut ep: Vec<Vec<EvRaw>> = (0..NP).map(|_| Vec::with_capacity(ev_res)).collect();
-                    let mut cp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::with_capacity(ck_res)).collect();
                     let cws = ctx.ws - WEEK_MS;
-                    let mut pend_e: Vec<EvRaw> = Vec::new();
                     let mut tsc = TsCache::new();
-                    let mut pend_c: Vec<Ck> = Vec::new();
+                    let mut pend_c: Vec<Ck> = Vec::with_capacity(ck_res * NP);
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
                         if j >= jobs.len() {
@@ -878,20 +926,8 @@ fn main() {
                                     r.ts = ts;
                                     r.valid = true;
                                 }
-                                if r.valid { pend_e.push(r); } else { ep[part_of(eid)].push(r); }
+                                ep[part_of(eid)].push(r);
                             });
-                            const PD: usize = 12;
-                            for q in 0..pend_e.len() {
-                                if q + PD < pend_e.len() {
-                                    ctx.link_map.prefetch(pend_e[q + PD].person);
-                                }
-                                let mut r = pend_e[q];
-                                let (p, nm) = resolve(&ctx, r.person, r.name);
-                                r.person = p;
-                                r.name = nm;
-                                ep[part_of(r.eid)].push(r);
-                            }
-                            pend_e.clear();
                         } else {
                             scan::<4>(buf, s, e, |_ls, f| {
                                 let g = |k: usize| &buf[f[k].0 as usize..f[k].1 as usize];
@@ -916,24 +952,13 @@ fn main() {
                                 let cref = mkref(bi, f[0].0 as usize, cid.len());
                                 pend_c.push(Ck { person: h64(uid), ts, cref, camp });
                             });
-                            const PD: usize = 12;
-                            for q in 0..pend_c.len() {
-                                if q + PD < pend_c.len() {
-                                    ctx.link_map.prefetch(pend_c[q + PD].person);
-                                }
-                                let mut c = pend_c[q];
-                                c.person = resolve(&ctx, c.person, 0).0;
-                                cp[part_of(c.person)].push(c);
-                            }
-                            pend_c.clear();
+
                         }
                     }
                     for (i, v) in ep.into_iter().enumerate() {
                         ev_parts[i].lock().unwrap().push(v);
                     }
-                    for (i, v) in cp.into_iter().enumerate() {
-                        ck_parts[i].lock().unwrap().push(v);
-                    }
+                    ck_all.lock().unwrap().push(pend_c);
                 });
             }
         });
@@ -942,12 +967,16 @@ fn main() {
 
     // ---------------- dedup events, repartition by person ----------------
     let pe_parts: Vec<Mutex<Vec<Vec<Ev>>>> = (0..NP).map(|_| Mutex::new(Vec::new())).collect();
+    let lm: &Flat = link_cell.get().expect("links");
     {
         let next = AtomicUsize::new(0);
         std::thread::scope(|sc| {
             for _ in 0..nthreads {
                 sc.spawn(|| {
                     let mut out: Vec<Vec<Ev>> = (0..NP).map(|_| Vec::with_capacity(ev_res)).collect();
+                    let mut tab_k: Vec<u64> = Vec::new();
+                    let mut tab_i: Vec<u32> = Vec::new();
+                    let mut kept: Vec<Ev> = Vec::new();
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
                         if j >= NP {
@@ -955,26 +984,78 @@ fn main() {
                         }
                         let vs = std::mem::take(&mut *ev_parts[j].lock().unwrap());
                         let total: usize = vs.iter().map(|v| v.len()).sum();
-                        let mut all: Vec<EvRaw> = Vec::with_capacity(total);
-                        for v in vs {
-                            all.extend_from_slice(&v);
-                        }
-                        all.sort_unstable_by(|a, b| a.eid.cmp(&b.eid).then(a.ingest.cmp(&b.ingest)));
-                        let mut i = 0;
-                        while i < all.len() {
-                            let r = all[i];
-                            let mut k = i + 1;
-                            while k < all.len() && all[k].eid == r.eid {
-                                k += 1;
+                        let cap = (total * 2).next_power_of_two().max(16);
+                        let mask = cap - 1;
+                        tab_k.clear();
+                        tab_k.resize(cap, 0);
+                        tab_i.clear();
+                        tab_i.resize(cap, u32::MAX);
+                        for (t, v) in vs.iter().enumerate() {
+                            for (x, r) in v.iter().enumerate() {
+                                let key = if r.eid == 0 { 1 } else { r.eid };
+                                let mut h = (key as usize ^ (key >> 29) as usize) & mask;
+                                loop {
+                                    let ti = tab_i[h];
+                                    if ti == u32::MAX {
+                                        tab_k[h] = key;
+                                        tab_i[h] = ((t as u32) << 27) | x as u32;
+                                        break;
+                                    }
+                                    if tab_k[h] == key {
+                                        let o = &vs[(ti >> 27) as usize][(ti & ((1 << 27) - 1)) as usize];
+                                        if r.ingest < o.ingest {
+                                            tab_i[h] = ((t as u32) << 27) | x as u32;
+                                        }
+                                        break;
+                                    }
+                                    h = (h + 1) & mask;
+                                }
                             }
-                            if r.valid {
-                                out[part_of(r.person)].push(Ev { person: r.person, ts: r.ts, name: r.name, price: r.price, cat: r.cat });
-                            }
-                            i = k;
                         }
+                        kept.clear();
+                        for &ti in tab_i.iter() {
+                            if ti != u32::MAX {
+                                let r = &vs[(ti >> 27) as usize][(ti & ((1 << 27) - 1)) as usize];
+                                if r.valid {
+                                    kept.push(Ev { person: r.person, ts: r.ts, name: r.name, price: r.price, cat: r.cat });
+                                }
+                            }
+                        }
+                        const PD: usize = 12;
+                        for q in 0..kept.len() {
+                            if q + PD < kept.len() {
+                                lm.prefetch(kept[q + PD].person);
+                            }
+                            let mut r = kept[q];
+                            let (p, nm) = resolve(lm, r.person, r.name);
+                            r.person = p;
+                            r.name = nm;
+                            out[part_of(p)].push(r);
+                        }
+                        drop(vs);
                     }
                     for (i, v) in out.into_iter().enumerate() {
                         pe_parts[i].lock().unwrap().push(v);
+                    }
+                    // clicks: resolve person and partition
+                    let mut cout: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::with_capacity(ck_res)).collect();
+                    loop {
+                        let v = match ck_all.lock().unwrap().pop() {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        const PD: usize = 12;
+                        for q in 0..v.len() {
+                            if q + PD < v.len() {
+                                lm.prefetch(v[q + PD].person);
+                            }
+                            let mut c = v[q];
+                            c.person = resolve(lm, c.person, 0).0;
+                            cout[part_of(c.person)].push(c);
+                        }
+                    }
+                    for (i, v) in cout.into_iter().enumerate() {
+                        ck_parts[i].lock().unwrap().push(v);
                     }
                 });
             }
@@ -1221,12 +1302,12 @@ fn main() {
                 let mut c_r = Vec::with_capacity(rows.len());
                 let mut c_t = Vec::with_capacity(rows.len());
                 for r in rows {
-                    c_name.push(deref(bufs, r.name).to_vec());
+                    c_name.push(deref(bufs, r.name));
                     c_day.push(r.day);
                     c_s.push(r.sessions);
                     c_e.push(r.events);
                     c_r.push(r.revenue);
-                    c_t.push(if r.top >= 0 { Some(cat_names[r.top as usize].clone()) } else { None });
+                    c_t.push(if r.top >= 0 { Some(cat_names[r.top as usize]) } else { None });
                 }
                 let cols = vec![
                     parquet::Col { name: "user_id", data: parquet::ColData::Str(c_name) },
@@ -1252,8 +1333,8 @@ fn main() {
                 for d in 0..ndays {
                     let a = camp_acc[c * ndays + d];
                     if a[0] > 0 || a[3] > 0 {
-                        c_id.push(camp_ids[c].clone());
-                        c_ch.push(camp_ch[c].clone());
+                        c_id.push(camp_ids[c]);
+                        c_ch.push(camp_ch[c]);
                         c_day.push((ws_day + d as i64) as i32);
                         c_s.push(a[0]);
                         c_p.push(a[1]);
